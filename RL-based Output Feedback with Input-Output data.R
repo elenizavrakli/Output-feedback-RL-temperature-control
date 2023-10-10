@@ -102,13 +102,13 @@ errnorm <- matrix(0,n_iter,n_dat) #error norm for exiting the loop
 #Initial values
 x[,1]<- rep(50,n)
 y[,1] <- rep(50,p)
-#r[,1] <- c(190,180,170,165,160)
 r[,1] <- c(150,160,170,175,180)
 u[,1] <- -Kgain_data_sim%*%x[,1] + noise_func(m,1)
 yaug[,1] <- c(y[,1],r[,1])
 z[,1] <-  rnorm(l)
 cost[1] <- t(yaug[,1])%*%Q2%*%yaug[,1]+t(u[,1])%*%R%*%u[,1]
 
+#Data generation
 for(k in 1:(n_dat-1)){
   x[,k+1] = A%*%x[,k] + B%*%u[,k]
   y[,k+1] = C%*%x[,k+1]
@@ -116,7 +116,6 @@ for(k in 1:(n_dat-1)){
   yaug[,k+1] = c(y[,k+1],r[,k+1])
   
   u[,k+1] = -Kgain_data_sim%*%x[,k+1] + noise_func(m,k+1)
-  
   
   if(k<N){
     z[,k+1] <- rnorm(l)
@@ -143,13 +142,15 @@ for(k in (N+1):n_dat){
   lhsvi[k,] = kronecker(t(z[,k]),t(z[,k]))
 }
 
+#C++ function calculating the sum of cross products, matrix to be inverted for the least squares algorithm.
 sourceCpp("summcrossprod.cpp")
-summat=sumcrossprod(lhsvi,N,n_dat+l-1) #indices correct?????
-
+summat=sumcrossprod(lhsvi,N,n_dat+l-1)
 leftmat = summat + mu*diag(l^2)
+#Use cholesky decomposition to invert the matrix
 chol_decomp = chol(leftmat)
 inverse_leftmat = chol2inv(chol_decomp)
 
+#Training to learn an estimate of matrix H using least squares
 for(i in 1:n_iter){
   pb_iter$tick()
   p0=Holdvi[(l-m+1):l,(l-m+1):l,drop=FALSE]
@@ -167,7 +168,6 @@ for(i in 1:n_iter){
   for(j in (N+1):(n_dat+l)){
     sumvec = sumvec + lhsvi[j,]*costvi[j]
   }
-  
   rightvec = sumvec
   
   HLS_est = inverse_leftmat %*% rightvec  
@@ -184,3 +184,110 @@ for(i in 1:n_iter){
   pr=Holdvi[(l-m+1):l,(N*m+N*p+1):(N*m+N*p+p),drop=FALSE]
   kgainfinal = ginv(p0)%*%cbind(pu,py,pr)
 }
+
+#Simulate system's behaviour with obtained controller
+Kest=kgainfinal
+xopt <- c(150,160,170,175,180)
+layer_number = 100
+
+#Initialise all vectors used
+x <- matrix(0,n,n_dat) #state
+y <- matrix(0,p,n_dat) #measurement  
+u <- matrix(0,m,n_dat) #input
+r <- matrix(0,p,n_dat) #reference trajectory
+yaug <- matrix(0,2*p,n_dat) #[measurement,reference]
+z_pl <- matrix(0,l-m,n_dat) #augmented state [\ubar_{k-1,k-N},\ybar_{k-1,k-N},r_{k_N},u_k]
+cost <- matrix(0,layer_number,1)
+ubar <- matrix(0,N*m,n_dat)
+ybar <- matrix(0,N*p,n_dat)
+
+#Initial values
+x[,1]<- rep(50,n)
+y[,1] <- rep(50,p)
+r[,1] <- c(150,160,170,175,180)
+u[,1] <- -Kgain_data_sim%*%x[,1] 
+yaug[,1] <- c(y[,1],r[,1])
+z_pl[,1] <-  rnorm(l-m)
+cost[1] <- t(yaug[,1])%*%Q2%*%yaug[,1]+t(u[,1])%*%R%*%u[,1]
+xvec<-y[,1]
+
+for(k in 1:N){
+  x[,k+1] = A%*%x[,k] + B%*%u[,k]
+  y[,k+1] = C%*%x[,k+1]
+  r[,k+1] = Ft%*%r[,k]
+  yaug[,k+1] = c(y[,k+1],r[,k+1])
+  
+  u[,k+1] = -Kgain_data_sim%*%x[,k+1]
+  
+  if(k<N){
+    z_pl[,k+1] <- rnorm(l-m)
+  }else{
+    for(bar in 0:(N-1)){
+      ubar[(bar*m+1):((bar+1)*m),k+1] <- u[,k-bar]
+      ybar[(bar*p+1):((bar+1)*p),k+1] <- y[,k-bar]
+    }
+    z_pl[,k+1] <- c(ubar[,k+1],ybar[,k+1],r[,k-N+1])
+  }
+  cost[k+1]=cost[k]+gam^(k-1)*t(yaug[,k+1])%*%Q2%*%yaug[,k+1]+t(u[,k+1])%*%R%*%u[,k+1]
+  xvec<-cbind(xvec, y[,k+1])
+}
+
+for(k in (N+1):layer_number){
+  x[,k+1] = A%*%x[,k] + B%*%u[,k]
+  y[,k+1] = C%*%x[,k+1]
+  r[,k+1] = Ft%*%r[,k]
+  yaug[,k+1] = c(y[,k+1],r[,k+1])
+  
+  for(bar in 0:(N-1)){
+    ubar[(bar*m+1):((bar+1)*m),k+1] <- u[,k-bar]
+    ybar[(bar*p+1):((bar+1)*p),k+1] <- y[,k-bar]
+  }
+  z_pl[,k+1] <- c(ubar[,k+1],ybar[,k+1],r[,k-N+1])
+  
+  u[,k+1] = -Kest%*%z_pl[,k+1]
+  
+  cost[k+1]=cost[k]+gam^(k-1)*t(yaug[,k+1])%*%Q2%*%yaug[,k+1]+t(u[,k+1])%*%R%*%u[,k+1]
+  xvec<-cbind(xvec, y[,k+1])
+}
+
+#Plot trajectories
+xvec<-t(xvec)
+xvec<-as.data.frame(cbind(1:(layer_number),xvec[1:layer_number,]))
+colnames(xvec) <- c("time","measurement 1","measurement 2","measurement 3","measurement 4","measurement 5")
+xvec[-1,c("time","measurement 1","measurement 2","measurement 3","measurement 4","measurement 5")] %>%
+  #xvec[-1,c("layer","heater 1","heater 2","heater 3")] %>%
+  gather(variable,value,-time) %>%
+  ggplot(aes(x=time,y=value,color=variable))+
+  geom_line(size=1)+
+  theme_classic()+
+  #ylim(0,200)+
+  #theme(legend.position = "none",axis.title.x=element_blank(),axis.title.y=element_blank())+
+  labs(x='time',y='heater temperature evolution')
+#ggsave("output feedback no BO.pdf",width=10,height=4)
+norm(as.matrix(xvec[layer_number,-1]-xopt),type="2")
+
+#Plot performance index
+cost_plot<-as_data_frame(cbind(1:(layer_number+1),cost))
+colnames(cost_plot)<-c("time","cost sum")
+cost_plot[,c("time","cost sum")] %>%
+  gather(variable,value,-time) %>%
+  ggplot(aes(x=time,y=value,color=variable))+
+  geom_line(size=1)+
+  theme_classic()+
+  theme(legend.position = "none")+
+  labs(x='time',y='sum of discounted costs')
+#ggsave("output feedback, perf index, BO.pdf",width=10,height=4)
+
+#bocost=cost #to be used when using the optimised weighting matrices through Bayesian Optimisation
+
+#Comparative plot of performance indices vefore and after B.Opt.
+# comp_cost_plot<-as_data_frame(cbind(1:101,cost[1:101],bocost[1:101]))
+# colnames(comp_cost_plot)<-c("time","without BO","with BO")
+# comp_cost_plot[-1,c("time","without BO","with BO")] %>%
+#   gather(variable,value,-time) %>%
+#   ggplot(aes(x=time,y=value,color=variable))+
+#   geom_line(size=1)+
+#   theme_classic()+
+#   #theme(legend.position = "none")+
+#   labs(x='time',y='sum of discounted costs')
+# ggsave("output feedback cost comparison.pdf",width=10,height=4)
